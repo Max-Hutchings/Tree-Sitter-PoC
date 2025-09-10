@@ -99,5 +99,13 @@ def main():
     print(j)
 
 
+    # Perform queries
+    print("Imports:", indexer.query_imports(SAMPLE_JAVA))
+    print("Has deleteUser method:", indexer.query_method(SAMPLE_JAVA, "deleteUser"))
+    print("Has addUser method:", indexer.query_method(SAMPLE_JAVA, "addUser"))
+    print("Methods creating ArrayList:", indexer.query_new_arraylist(SAMPLE_JAVA))
+    print("Methods with .add() calls:", indexer.query_add_method_calls(SAMPLE_JAVA))
+
+
 if __name__ == "__main__":
     main()

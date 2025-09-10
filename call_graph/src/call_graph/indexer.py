@@ -48,6 +48,31 @@ def load_java_language():
 
 # --- The Indexer -------------------------------------------------------------
 
+def enclosing_names(node):
+    cls = None
+    mth = None
+    cur = node
+    while cur is not None:
+        t = cur.type
+        if t == "method_declaration":
+            for i in range(cur.named_child_count):
+                ch = cur.named_child(i)
+                if ch.type == "identifier" and mth is None:
+                    mth = ch
+        elif t == "constructor_declaration":
+            for i in range(cur.named_child_count):
+                ch = cur.named_child(i)
+                if ch.type == "identifier" and mth is None:
+                    mth = ch
+        elif t in ("class_declaration", "interface_declaration", "enum_declaration"):
+            for i in range(cur.named_child_count):
+                ch = cur.named_child(i)
+                if ch.type == "identifier" and cls is None:
+                    cls = ch
+        cur = cur.parent
+    return (cls, mth)
+
+
 class JavaIndexer:
     """
     Walks a Tree-sitter Java AST to build a minimal semantic index:
@@ -55,6 +80,7 @@ class JavaIndexer:
     """
 
     def __init__(self):
+        """Initialize the Java Tree-sitter parser and in-memory index containers."""
         self.language = load_java_language()
         self.parser = Parser()
         self.parser.set_language(self.language)
@@ -233,3 +259,140 @@ class JavaIndexer:
 
             # Continue DFS
             stack.extend(node.children)
+
+    def query_imports(self, source_code):
+        """Return a list of all raw import declarations found in the provided Java source string."""
+        # This query finds all import declarations in the Java source code.
+        # "import_declaration" is a node type in the Tree-sitter Java grammar that represents import statements.
+        # "@import" is a named capture group for the entire "import_declaration" node.
+        query = "(import_declaration) @import"
+        return self._execute_query(query, source_code)
+
+    def query_method(self, source_code, method_name):
+        """Locate methods by simple name within classes; returns list of {class_name, line, col}."""
+        # This query checks if a method with the given name exists in the Java source code.
+        # "method_declaration" is a node type representing method definitions.
+        # "identifier" is a child node of "method_declaration" that holds the method's name.
+        # "@name" is a named capture group that allows us to extract the matched "identifier" node.
+        # "(#eq? @name \"{method_name}\")" is a predicate that ensures the captured name matches the given method_name.
+        query = f"(class_declaration name: (identifier) @class_name body: (class_body (method_declaration (identifier) @name (#eq? @name \"{method_name}\"))))"
+        tree = self.parser.parse(bytes(source_code, "utf8"))
+        query_obj = self.language.query(query)
+        captures = query_obj.captures(tree.root_node)
+
+        # Extract class name, line, and column for each match
+        matches = []
+        for capture in captures:
+            if capture[1] == "name":
+                method_node = capture[0]
+                line, col = node_point(method_node)
+                class_name = None
+
+                # Find the associated class name
+                for c in captures:
+                    if c[1] == "class_name":
+                        class_name = node_text(source_code.encode("utf8"), c[0])
+                        break
+
+                matches.append({"class_name": class_name, "line": line, "col": col})
+
+        return matches
+
+
+
+    def query_new_arraylist(self, source_code: str):
+        """Find all 'new ArrayList(...)' constructions, returning context (class, method, line, col)."""
+        # Match any `new ArrayList(...)` or `new java.util.ArrayList(...)`,
+        # with or without generics: ArrayList<>, ArrayList<String>, etc.
+        query = r"""
+        (
+          (object_creation_expression
+            type: (_) @type
+          ) @new_object
+          (#match? @type "(^|\\.)ArrayList(\\s*<.*?>)?$")
+        )
+        """
+
+        tree = self.parser.parse(bytes(source_code, "utf8"))
+        query_obj = self.language.query(query)
+        captures = query_obj.captures(tree.root_node)
+
+        src_bytes = source_code.encode("utf8")
+        matches = []
+
+        for node, cap_name in captures:
+            if cap_name == "new_object":
+                cls_node, mth_node = enclosing_names(node)
+                class_name = node_text(src_bytes, cls_node) if cls_node else None
+                method_name = node_text(src_bytes, mth_node) if mth_node else None
+                line, col = node_point(node)
+                matches.append({
+                    "class_name": class_name,
+                    "method_name": method_name,  # NOTE: will be None for field initializers
+                    "line": line,
+                    "col": col
+                })
+
+        return matches
+
+
+
+
+
+    def query_add_method_calls(self, source_code: str):
+        """
+        Find every `.add(...)` call in the source and return context.
+        Returns: [{class_name, method_name, line, col}, ...]
+        - Works for obj.add(...), this.add(...), super.add(...), SomeType.add(...)
+        - If the call is outside a method body (e.g., field/initializer), method_name will be None.
+        """
+        # Tree-sitter: a method call is `method_invocation` with fields:
+        #   object? type_arguments? name arguments
+        # We match any method_invocation whose `name` == "add".
+        query = r"""
+        (
+          (method_invocation
+            name: (identifier) @name
+          ) @call
+          (#eq? @name "add")
+        )
+        """
+
+        # Parse once
+        tree = self.parser.parse(source_code.encode("utf8"))
+        query_obj = self.language.query(query)
+        captures = query_obj.captures(tree.root_node)
+
+        src_bytes = source_code.encode("utf8")
+        results = []
+
+        # Iterate over captures and record only the full call nodes (`@call`)
+        for node, cap_name in captures:
+            if cap_name != "call":
+                continue
+
+            # Anchor the location to the 'add' identifier for precise column
+            name_node = node.child_by_field_name("name") or node
+            line, col = node_point(name_node)
+
+            # Resolve class & method owner by walking ancestors
+            cls_node, mth_node = enclosing_names(node)
+            class_name = node_text(src_bytes, cls_node) if cls_node else None
+            method_name = node_text(src_bytes, mth_node) if mth_node else None
+
+            results.append({
+                "class_name": class_name,
+                "method_name": method_name,
+                "line": line,
+                "col": col
+            })
+
+        return results
+
+    def _execute_query(self, query, source_code):
+        """Execute a raw Tree-sitter query string against source and return captured node texts."""
+        tree = self.parser.parse(bytes(source_code, "utf8"))
+        language = load_java_language()  # Ensure we use the correct Language object
+        query_obj = language.query(query)
+        captures = query_obj.captures(tree.root_node)
+        return [node_text(source_code.encode("utf8"), c[0]) for c in captures if isinstance(c[0], Node)]
